@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -15,6 +16,8 @@ type OutboxMessage struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+var processedCount int64
+
 func main() {
 	dbpool, err := getPool()
 	if err != nil {
@@ -25,17 +28,19 @@ func main() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
+	batchSize := 1000
+
 	for {
 		select {
 		case <-ticker.C:
-			if err := processMessages(dbpool); err != nil {
+			if err := processMessages(dbpool, batchSize); err != nil {
 				log.Printf("Error processing messages: %v", err)
 			}
 		}
 	}
 }
 
-func processMessages(dbpool *pgxpool.Pool) error {
+func processMessages(dbpool *pgxpool.Pool, limit int) error {
 	log.Println("Processing outbox messages")
 
 	tx, err := dbpool.Begin(context.Background())
@@ -45,10 +50,10 @@ func processMessages(dbpool *pgxpool.Pool) error {
 	}
 	defer tx.Rollback(context.Background())
 
-	rows, err := tx.Query(
-		context.Background(),
-		"SELECT id, entity_id, payload, created_at FROM outbox_messages WHERE processed_at IS NULL ORDER BY created_at LIMIT 100 FOR UPDATE SKIP LOCKED",
-	)
+	query := "SELECT id, entity_id, payload, created_at FROM outbox_messages WHERE processed_at IS NULL ORDER BY created_at LIMIT $1 FOR UPDATE SKIP LOCKED"
+
+	rows, err := tx.Query(context.Background(), query, limit)
+
 	if err != nil {
 		log.Fatalf("Error querying outbox messages: %v", err)
 		return err
@@ -81,10 +86,14 @@ func processMessages(dbpool *pgxpool.Pool) error {
 		}
 	}
 
+	atomic.AddInt64(&processedCount, int64(len(messages)))
+
 	if err := tx.Commit(context.Background()); err != nil {
 		log.Fatalf("Error committing transaction: %v", err)
 		return err
 	}
+
+	log.Printf("Processed %d outbox messages", processedCount)
 
 	return nil
 }
