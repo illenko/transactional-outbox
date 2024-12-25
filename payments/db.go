@@ -12,19 +12,19 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
-func createPayment(dbpool *pgxpool.Pool, payment *Payment) error {
+func createPayment(ctx context.Context, dbpool *pgxpool.Pool, payment *Payment) error {
 	now := time.Now()
 	payment.CreatedAt = now
 	payment.UpdatedAt = now
 
-	tx, err := dbpool.Begin(context.Background())
+	tx, err := dbpool.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(context.Background())
+	defer tx.Rollback(ctx)
 
 	err = tx.QueryRow(
-		context.Background(),
+		ctx,
 		"INSERT INTO payment (user_id, amount, status, created_at, updated_at) VALUES ($1, $2, $3, $4, $5) RETURNING id",
 		payment.UserID, payment.Amount, payment.Status, payment.CreatedAt, payment.UpdatedAt,
 	).Scan(&payment.ID)
@@ -37,22 +37,22 @@ func createPayment(dbpool *pgxpool.Pool, payment *Payment) error {
 		Data: *payment,
 	}
 
-	if err := insertOutboxMessage(tx, payment.ID, event); err != nil {
+	if err := insertOutboxMessage(ctx, tx, payment.ID, event); err != nil {
 		return err
 	}
 
-	return tx.Commit(context.Background())
+	return tx.Commit(ctx)
 }
 
-func updatePaymentStatus(dbpool *pgxpool.Pool, id string, status string) (*Payment, error) {
-	tx, err := dbpool.Begin(context.Background())
+func updatePaymentStatus(ctx context.Context, dbpool *pgxpool.Pool, id string, status string) (*Payment, error) {
+	tx, err := dbpool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback(context.Background())
+	defer tx.Rollback(ctx)
 
 	result, err := tx.Exec(
-		context.Background(),
+		ctx,
 		"UPDATE payment SET status=$1, updated_at=$2 WHERE id=$3",
 		status, time.Now(), id,
 	)
@@ -67,7 +67,7 @@ func updatePaymentStatus(dbpool *pgxpool.Pool, id string, status string) (*Payme
 
 	var payment Payment
 	err = tx.QueryRow(
-		context.Background(),
+		ctx,
 		"SELECT id, user_id, amount, status, created_at, updated_at FROM payment WHERE id=$1",
 		id,
 	).Scan(&payment.ID, &payment.UserID, &payment.Amount, &payment.Status, &payment.CreatedAt, &payment.UpdatedAt)
@@ -80,18 +80,18 @@ func updatePaymentStatus(dbpool *pgxpool.Pool, id string, status string) (*Payme
 		Data: payment,
 	}
 
-	if err := insertOutboxMessage(tx, payment.ID, event); err != nil {
+	if err := insertOutboxMessage(ctx, tx, payment.ID, event); err != nil {
 		return nil, err
 	}
 
-	if err := tx.Commit(context.Background()); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 
 	return &payment, nil
 }
 
-func insertOutboxMessage(tx pgx.Tx, entityID int, event PaymentEvent) error {
+func insertOutboxMessage(ctx context.Context, tx pgx.Tx, entityID int, event PaymentEvent) error {
 	eventPayload, err := json.Marshal(event)
 	if err != nil {
 		return err
@@ -105,7 +105,7 @@ func insertOutboxMessage(tx pgx.Tx, entityID int, event PaymentEvent) error {
 	}
 
 	_, err = tx.Exec(
-		context.Background(),
+		ctx,
 		"INSERT INTO outbox_messages (id, entity_id, payload, created_at) VALUES ($1, $2, $3, $4)",
 		outboxMessage.ID, outboxMessage.EntityID, outboxMessage.Payload, outboxMessage.CreatedAt,
 	)

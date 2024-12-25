@@ -2,8 +2,9 @@ package main
 
 import (
 	"encoding/json"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"net/http"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func createPaymentHandler(dbpool *pgxpool.Pool) http.HandlerFunc {
@@ -14,7 +15,9 @@ func createPaymentHandler(dbpool *pgxpool.Pool) http.HandlerFunc {
 			return
 		}
 
-		if err := createPayment(dbpool, &payment); err != nil {
+		ctx := r.Context()
+
+		if err := createPayment(ctx, dbpool, &payment); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -34,7 +37,8 @@ func updatePaymentHandler(dbpool *pgxpool.Pool) http.HandlerFunc {
 			return
 		}
 
-		payment, err := updatePaymentStatus(dbpool, id, paymentUpdate.Status)
+		ctx := r.Context()
+		payment, err := updatePaymentStatus(ctx, dbpool, id, paymentUpdate.Status)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
