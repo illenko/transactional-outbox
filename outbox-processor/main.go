@@ -4,12 +4,15 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/segmentio/kafka-go"
 )
 
 type OutboxMessage struct {
@@ -33,21 +36,24 @@ var (
 func main() {
 
 	go func() {
-		dbpool, err := getPool()
+		dbpool, err := newPool()
 		if err != nil {
 			log.Fatal(err)
 		}
 		defer dbpool.Close()
 
-		ticker := time.NewTicker(1 * time.Second)
+		writer := newKafkaWriter("localhost:9092", "payment-events")
+		defer writer.Close()
+
+		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 
-		batchSize := 5
+		batchSize := 100
 		for {
 			select {
 			case <-ticker.C:
 				start := time.Now()
-				if err := processMessages(dbpool, batchSize); err != nil {
+				if err := processMessages(dbpool, writer, batchSize); err != nil {
 					log.Printf("Error processing messages: %v", err)
 				}
 				elapsed := time.Since(start)
@@ -60,7 +66,7 @@ func main() {
 	http.ListenAndServe(":8081", nil)
 }
 
-func processMessages(dbpool *pgxpool.Pool, limit int) error {
+func processMessages(dbpool *pgxpool.Pool, writer *kafka.Writer, limit int) error {
 	ctx := context.Background()
 
 	tx, err := dbpool.Begin(ctx)
@@ -92,14 +98,45 @@ func processMessages(dbpool *pgxpool.Pool, limit int) error {
 
 	log.Printf("Found %d outbox messages", len(messages))
 
-	for _, outboxMessage := range messages {
-		log.Printf("Processing outbox message: %v", outboxMessage)
+	var kafkaMessages []kafka.Message
 
-		_, err := tx.Exec(ctx, "UPDATE outbox_messages SET processed_at=$1 WHERE id=$2", time.Now(), outboxMessage.ID)
-		if err != nil {
-			log.Fatalf("Error updating outbox message: %v", err)
-			return err
+	for _, m := range messages {
+		start := time.Now()
+
+		msg := kafka.Message{
+			Key:   []byte(strconv.Itoa(m.EntityID)),
+			Value: []byte(m.Payload),
 		}
+
+		kafkaMessages = append(kafkaMessages, msg)
+
+		elapsed := time.Since(start)
+		log.Printf("Preparing message took: (%s) %s", m.EntityID, elapsed)
+	}
+
+	start := time.Now()
+	err = writer.WriteMessages(context.Background(), kafkaMessages...)
+	elapsed := time.Since(start)
+	log.Printf("Writing messages took %s", elapsed)
+
+	if err != nil {
+		messagesFailed.Add(float64(len(messages)))
+		log.Printf("Error writing messages: %v", err)
+	}
+
+	b := &pgx.Batch{}
+
+	for _, m := range messages {
+		sql := `UPDATE outbox_messages SET processed_at = $1, error =  $2 WHERE id = $3`
+
+		b.Queue(sql, time.Now(), err != nil, m.ID)
+	}
+
+	if err := tx.SendBatch(ctx, b).Close(); err != nil {
+		log.Printf("Error sending batch: %v", err)
+
+		messagesFailed.Add(float64(len(messages)))
+		return err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -114,10 +151,23 @@ func processMessages(dbpool *pgxpool.Pool, limit int) error {
 	return nil
 }
 
-func getPool() (*pgxpool.Pool, error) {
+func newPool() (*pgxpool.Pool, error) {
 	dbpool, err := pgxpool.New(context.Background(), "postgres://postgres:postgres@localhost:5432/postgres")
 	if err != nil {
 		return nil, err
 	}
 	return dbpool, nil
+}
+
+func newKafkaWriter(kafkaURL, topic string) *kafka.Writer {
+	return &kafka.Writer{
+		Addr:                   kafka.TCP(kafkaURL),
+		Topic:                  topic,
+		Balancer:               &kafka.ReferenceHash{},
+		BatchSize:              100,
+		RequiredAcks:           kafka.RequireAll,
+		BatchTimeout:           100 * time.Millisecond,
+		Async:                  false,
+		AllowAutoTopicCreation: false,
+	}
 }
